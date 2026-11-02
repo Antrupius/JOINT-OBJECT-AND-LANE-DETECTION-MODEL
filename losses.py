@@ -1,0 +1,103 @@
+"""Joint object-detection and lane-detection losses."""
+import torch
+import torch.nn.functional as F
+
+
+def ufld_focal_softbin_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    gamma: float = 2.0,
+    smoothing: float = 0.1,
+    foreground_weight: float = 4.0,
+) -> torch.Tensor:
+    """Weighted focal CE with soft adjacent-bin labels for row-anchor lanes.
+
+    logits: (B, lanes, rows, bins+background); targets: (B, lanes, rows).
+    Class 0 is background; classes 1..N are horizontal bins.
+    """
+    if logits.ndim != 4 or targets.ndim != 3:
+        raise ValueError(
+            f"Expected logits (B,L,H,C) and targets (B,L,H); "
+            f"got {tuple(logits.shape)} and {tuple(targets.shape)}"
+        )
+    if logits.shape[:3] != targets.shape:
+        raise ValueError("Lane logits and target dimensions do not match.")
+    n_classes = logits.shape[-1]
+    if targets.numel() and (targets.min() < 0 or targets.max() >= n_classes):
+        raise ValueError(
+            f"Lane targets must be in [0,{n_classes - 1}], "
+            f"got [{int(targets.min())},{int(targets.max())}]"
+        )
+    if not (0.0 <= smoothing < 1.0):
+        raise ValueError("smoothing must be in [0,1).")
+    if gamma < 0 or foreground_weight <= 0:
+        raise ValueError("gamma must be >= 0 and foreground_weight must be > 0.")
+
+    logits = logits.float().reshape(-1, n_classes)
+    targets = targets.long().reshape(-1)
+    log_probs = F.log_softmax(logits, dim=-1)
+    probs = log_probs.exp()
+    soft_targets = F.one_hot(targets, num_classes=n_classes).to(logits.dtype)
+    foreground = targets > 0
+    if smoothing > 0 and foreground.any():
+        fg_idx = foreground.nonzero(as_tuple=True)[0]
+        classes = targets[fg_idx]
+        soft_targets[fg_idx] *= (1.0 - smoothing)
+        for row_idx, class_idx in zip(fg_idx.tolist(), classes.tolist()):
+            neighbors = []
+            if class_idx > 1:
+                neighbors.append(class_idx - 1)
+            if class_idx < n_classes - 1:
+                neighbors.append(class_idx + 1)
+            if neighbors:
+                share = smoothing / len(neighbors)
+                for neighbor in neighbors:
+                    soft_targets[row_idx, neighbor] += share
+            else:
+                soft_targets[row_idx, class_idx] += smoothing
+    ce = -(soft_targets * log_probs).sum(dim=-1)
+    pt = (soft_targets * probs).sum(dim=-1).clamp_min(1e-8)
+    weights = torch.ones_like(ce)
+    weights[foreground] = foreground_weight
+    return (ce * (1.0 - pt).pow(gamma) * weights).sum() / weights.sum().clamp_min(1.0)
+
+
+def total_loss(out: dict, batch: dict, cfg, class_mask=None) -> torch.Tensor:
+    """Combine YOLO-style object loss and the preserved lane loss.
+
+    Samples without object labels are excluded from the object loss; samples
+    without lane labels are excluded from the lane loss.
+    """
+    device = out["lane_logits"].device
+    has_obj = batch["has_object_labels"].to(device)
+    has_lane = batch["has_lane_labels"].to(device)
+    # Keep a zero-valued graph connection so backward() is valid even when a
+    # batch contains no annotations for either task.
+    zero = out["lane_logits"].sum() * 0.0
+    obj_loss = zero
+    if has_obj.any():
+        from models.yolov5_detection import yolo_object_loss
+        idx = has_obj.nonzero(as_tuple=True)[0]
+        raw = [p[idx] for p in out["det_raw"]]
+        sub_batch = {
+            key: (
+                value[idx.to(value.device)]
+                if torch.is_tensor(value) and value.ndim > 0
+                else value
+            )
+            for key, value in batch.items()
+        }
+        obj_loss = getattr(cfg, "det_loss_weight", 1.0) * yolo_object_loss(
+            raw, sub_batch, image_h=384, image_w=640,
+            box_weight=getattr(cfg, "box_loss_weight", 0.05),
+            class_weights=getattr(cfg, "class_weights", None),
+            class_mask=class_mask,
+        )
+    lane_loss = zero
+    if has_lane.any():
+        idx = has_lane.nonzero(as_tuple=True)[0]
+        lane_loss = ufld_focal_softbin_loss(
+            out["lane_logits"][idx], batch["lane_targets"][idx],
+            gamma=2.0, smoothing=0.1, foreground_weight=4.0,
+        )
+    return obj_loss + lane_loss
